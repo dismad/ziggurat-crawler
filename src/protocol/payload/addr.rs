@@ -3,13 +3,15 @@
 use std::{
     convert::TryInto,
     io,
-    net::{IpAddr::*, Ipv6Addr, SocketAddr},
+    net::{IpAddr, IpAddr::*, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
 use bytes::{Buf, BufMut};
 use time::OffsetDateTime;
 
-use crate::protocol::payload::{codec::Codec, read_n_bytes, read_short_timestamp};
+use crate::protocol::payload::{
+    codec::Codec, read_n_bytes, read_short_timestamp, VarInt,
+};
 
 /// A list of network addresses, used for peering.
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -31,6 +33,21 @@ impl Addr {
     /// Returns an iterator over the list of network addresses.
     pub fn iter(&self) -> std::slice::Iter<NetworkAddr> {
         self.addrs.iter()
+    }
+
+    /// Decode a ZIP-155 / BIP-155 `addrv2` payload.
+    ///
+    /// Non-routable network IDs (Tor, I2P, CJDNS, unknown) are skipped so the
+    /// crawler only stores addresses it can actually dial.
+    pub fn decode_v2<B: Buf>(bytes: &mut B) -> io::Result<Self> {
+        let count = *VarInt::decode(bytes)?;
+        let mut addrs = Vec::with_capacity(count.min(1000));
+        for _ in 0..count {
+            if let Some(addr) = NetworkAddr::decode_v2(bytes)? {
+                addrs.push(addr);
+            }
+        }
+        Ok(Self { addrs })
     }
 }
 
@@ -105,6 +122,58 @@ impl NetworkAddr {
             services,
             addr: SocketAddr::new(ip_addr, port),
         })
+    }
+
+    /// Decode one ZIP-155 address. Returns `Ok(None)` for non-IP network IDs.
+    pub(super) fn decode_v2<B: Buf>(bytes: &mut B) -> io::Result<Option<Self>> {
+        let timestamp = read_short_timestamp(bytes)?;
+        let services = *VarInt::decode(bytes)? as u64;
+        let network_id = u8::from_le_bytes(read_n_bytes(bytes)?);
+        let addr_len = *VarInt::decode(bytes)?;
+
+        if bytes.remaining() < addr_len + 2 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+
+        let mut addr_bytes = vec![0u8; addr_len];
+        bytes.copy_to_slice(&mut addr_bytes);
+        let port = u16::from_be_bytes(read_n_bytes(bytes)?);
+
+        if port == 0 {
+            return Ok(None);
+        }
+
+        const NET_IPV4: u8 = 0x01;
+        const NET_IPV6: u8 = 0x02;
+
+        let ip = match (network_id, addr_len) {
+            (NET_IPV4, 4) => IpAddr::V4(Ipv4Addr::new(
+                addr_bytes[0],
+                addr_bytes[1],
+                addr_bytes[2],
+                addr_bytes[3],
+            )),
+            (NET_IPV6, 16) => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&addr_bytes);
+                let v6 = Ipv6Addr::from(octets);
+                match v6.to_ipv4() {
+                    Some(v4) => IpAddr::V4(v4),
+                    None => IpAddr::V6(v6),
+                }
+            }
+            _ => return Ok(None),
+        };
+
+        if ip.is_unspecified() || ip.is_multicast() {
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            last_seen: Some(timestamp),
+            services,
+            addr: SocketAddr::new(ip, port),
+        }))
     }
 }
 

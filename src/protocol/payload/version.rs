@@ -98,7 +98,12 @@ impl Codec for Version {
         let user_agent = VarStr::decode(bytes)?;
 
         let start_height = i32::from_le_bytes(read_n_bytes(bytes)?);
-        let relay = u8::from_le_bytes(read_n_bytes(bytes)?) != 0;
+        // BIP37 `relay` is optional on older version payloads.
+        let relay = if bytes.remaining() > 0 {
+            u8::from_le_bytes(read_n_bytes(bytes)?) != 0
+        } else {
+            false
+        };
 
         Ok(Self {
             version,

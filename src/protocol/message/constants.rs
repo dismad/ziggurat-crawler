@@ -50,3 +50,11 @@ pub const FILTERLOAD_COMMAND: [u8; COMMAND_LEN] = *b"filterload\0\0";
 pub const FILTERADD_COMMAND: [u8; COMMAND_LEN] = *b"filteradd\0\0\0";
 pub const FILTERCLEAR_COMMAND: [u8; COMMAND_LEN] = *b"filterclear\0";
 pub const ALERT_COMMAND: [u8; COMMAND_LEN] = *b"alert\0\0\0\0\0\0\0";
+// Bitcoin-inherited / ZIP-155 commands seen on live Zcash peers.
+// Unknown commands must be ignored, not treated as a decode error.
+pub const SENDHEADERS_COMMAND: [u8; COMMAND_LEN] = *b"sendheaders\0";
+pub const SENDADDRV2_COMMAND: [u8; COMMAND_LEN] = *b"sendaddrv2\0\0";
+pub const ADDRV2_COMMAND: [u8; COMMAND_LEN] = *b"addrv2\0\0\0\0\0\0";
+pub const SENDCMPCT_COMMAND: [u8; COMMAND_LEN] = *b"sendcmpct\0\0\0";
+pub const FEEFILTER_COMMAND: [u8; COMMAND_LEN] = *b"feefilter\0\0\0";
+pub const WTXIDRELAY_COMMAND: [u8; COMMAND_LEN] = *b"wtxidrelay\0\0";

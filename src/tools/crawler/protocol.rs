@@ -1,4 +1,9 @@
-use std::{io, net::SocketAddr, sync::Arc, time::Instant};
+use std::{
+    io,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Instant,
+};
 
 use futures_util::SinkExt;
 use pea2pea::{
@@ -105,8 +110,9 @@ impl Crawler {
 
 #[async_trait::async_trait]
 impl Handshake for Crawler {
-    // Set handshake timeout to 300ms
-    const TIMEOUT_MS: u64 = 300;
+    // Only needs to cover sending our version. Remote version is handled in
+    // process_message because Zebra can delay it for tens of seconds.
+    const TIMEOUT_MS: u64 = 2_000;
 
     async fn perform_handshake(&self, mut conn: Connection) -> io::Result<Connection> {
         let conn_addr = conn.addr();
@@ -136,22 +142,21 @@ impl Reading for Crawler {
     async fn process_message(&self, source: SocketAddr, message: Self::Message) -> io::Result<()> {
         match message {
             Message::Addr(addr) => {
-                let len = addr.addrs.len();
+                let listening_addrs: Vec<SocketAddr> = addr
+                    .addrs
+                    .iter()
+                    .map(|a| a.addr)
+                    .filter(|a| is_dialable(*a))
+                    .collect();
+                let len = listening_addrs.len();
                 info!(parent: self.node().span(), "got {} address(es) from {}", len, source);
-
-                let mut listening_addrs = Vec::with_capacity(len);
-                for addr in &addr.addrs {
-                    listening_addrs.push(addr.addr);
-                }
 
                 self.known_network.add_addrs(source, &listening_addrs);
 
-                // Disconnect after getting more than 1 addresses or if the received address is
-                // not the same as the source address.
-                // In theory, zero length addr response has no sense but it's not
-                // forbidden by the standard so we should handle it. (that's why there is len == 1
-                // condition preventing address comparision to source when len would be 0).
-                if len > 1 || (len == 1 && addr.addrs[0].addr != source) {
+                // Disconnect after a real peer dump. Keep the socket only if the
+                // peer echoed solely its own address — a follow-up getaddr
+                // response may still arrive.
+                if len > 1 || (len == 1 && listening_addrs[0] != source) {
                     self.node().disconnect(source).await;
                     self.known_network
                         .set_node_state(source, ConnectionState::Disconnected);
@@ -181,16 +186,11 @@ impl Reading for Crawler {
                 }
 
                 let _ = self.unicast(source, Message::Verack)?.await;
-
-                // Send GetAddr as soon as we get version message from the peer.
-                // In fact, this part should be done during the handshake but it would increase
-                // handshake time and there are some nodes that do not send version message
-                // quickly (we know that zebra can delay sending version message for over 30 seconds).
-                // Sending GetAddr before receiving the version results in dropping this message by
-                // the remote peer, so we're stuck waiting for a reply that will never come that's why we
-                // need to wait for the remote version message response.
-                // Extra background: Sending GetAddr message was moved to this place,
-                // and it's not sent anymore directly from the main module.
+                // Advertise ZIP-155 support so Zebra/modern zcashd reply with
+                // addrv2 (and still accept classic addr).
+                let _ = self.unicast(source, Message::SendAddrV2)?.await;
+                // GetAddr only after we have their version. Sending it earlier
+                // is silently dropped and the 180s addr-wait then fires.
                 let _ = self.unicast(source, Message::GetAddr)?.await;
             }
             _ => {}
@@ -206,5 +206,15 @@ impl Writing for Crawler {
 
     fn codec(&self, _addr: SocketAddr, _side: ConnectionSide) -> Self::Codec {
         Default::default()
+    }
+}
+
+fn is_dialable(addr: SocketAddr) -> bool {
+    if addr.port() == 0 {
+        return false;
+    }
+    match addr.ip() {
+        IpAddr::V4(ip) => !(ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast()),
+        IpAddr::V6(ip) => !(ip.is_unspecified() || ip.is_multicast()),
     }
 }

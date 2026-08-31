@@ -97,6 +97,12 @@ pub enum Message {
     FilterAdd(FilterAdd),
     FilterClear,
     Alert,
+    /// Advertise ZIP-155 `addrv2` support (empty payload).
+    SendAddrV2,
+    /// BIP-130 request for header announcements (empty payload).
+    SendHeaders,
+    /// Command we do not implement. Payload is discarded; connection stays up.
+    Ignored([u8; COMMAND_LEN]),
 }
 
 macro_rules! encode_with_header_prefix {
@@ -175,8 +181,14 @@ impl Message {
             Self::FilterClear => {
                 encode_with_header_prefix!(FILTERCLEAR_COMMAND, buffer);
             }
-            // Don't send deprecated alert messages.
-            Self::Alert => (),
+            Self::SendAddrV2 => {
+                encode_with_header_prefix!(SENDADDRV2_COMMAND, buffer);
+            }
+            Self::SendHeaders => {
+                encode_with_header_prefix!(SENDHEADERS_COMMAND, buffer);
+            }
+            // Don't send deprecated alert messages or ignored inbound commands.
+            Self::Alert | Self::Ignored(_) => (),
         }
 
         Ok(())
@@ -201,16 +213,32 @@ impl Message {
             MEMPOOL_COMMAND => Self::MemPool,
             TX_COMMAND => Self::Tx(Tx::decode(bytes)?),
             REJECT_COMMAND => Self::Reject(Reject::decode(bytes)?),
+            FILTERLOAD_COMMAND => {
+                bytes.advance(bytes.remaining());
+                Self::Ignored(FILTERLOAD_COMMAND)
+            }
+            FILTERADD_COMMAND => {
+                bytes.advance(bytes.remaining());
+                Self::Ignored(FILTERADD_COMMAND)
+            }
+            FILTERCLEAR_COMMAND => Self::FilterClear,
+            ADDRV2_COMMAND => Self::Addr(Addr::decode_v2(bytes)?),
+            SENDADDRV2_COMMAND => Self::SendAddrV2,
+            SENDHEADERS_COMMAND => Self::SendHeaders,
+            SENDCMPCT_COMMAND | FEEFILTER_COMMAND | WTXIDRELAY_COMMAND => {
+                bytes.advance(bytes.remaining());
+                Self::Ignored(command)
+            }
             // Explicitly ignore alert messages since they are deprecated.
             ALERT_COMMAND => {
                 bytes.advance(bytes.remaining());
                 Self::Alert
             }
             cmd => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("Unknown command string: {cmd:?}"),
-                ))
+                // Bitcoin/Zcash peers ignore unknown commands. Dropping the
+                // connection here is what was shrinking the crawl graph.
+                bytes.advance(bytes.remaining());
+                Self::Ignored(cmd)
             }
         };
 
@@ -241,7 +269,54 @@ impl std::fmt::Display for Message {
             Message::FilterAdd(_) => f.write_str("FilterAdd"),
             Message::FilterClear => f.write_str("FilterClear"),
             Message::Alert => f.write_str("Alert"),
+            Message::SendAddrV2 => f.write_str("SendAddrV2"),
+            Message::SendHeaders => f.write_str("SendHeaders"),
+            Message::Ignored(cmd) => {
+                let name = cmd
+                    .iter()
+                    .take_while(|b| **b != 0)
+                    .map(|b| *b as char)
+                    .collect::<String>();
+                f.write_fmt(format_args!("Ignored({name})"))
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::BytesMut;
+
+    #[test]
+    fn sendheaders_is_not_a_decode_error() {
+        let mut empty = BytesMut::new();
+        let msg = Message::decode(SENDHEADERS_COMMAND, &mut empty).unwrap();
+        assert_eq!(msg, Message::SendHeaders);
+    }
+
+    #[test]
+    fn unknown_command_is_ignored() {
+        let mut empty = BytesMut::new();
+        let cmd = *b"notacommand\0";
+        let msg = Message::decode(cmd, &mut empty).unwrap();
+        assert_eq!(msg, Message::Ignored(cmd));
+    }
+
+    #[test]
+    fn addrv2_ipv4_roundtrip_shape() {
+        // count=1, time=1, services=1, net=ipv4, len=4, 1.2.3.4, port=8233
+        let mut payload = BytesMut::new();
+        payload.put_u8(1);
+        payload.put_u32_le(1);
+        payload.put_u8(1);
+        payload.put_u8(1);
+        payload.put_u8(4);
+        payload.put_slice(&[1, 2, 3, 4]);
+        payload.put_u16(8233);
+        let addr = Addr::decode_v2(&mut payload).unwrap();
+        assert_eq!(addr.addrs.len(), 1);
+        assert_eq!(addr.addrs[0].addr.to_string(), "1.2.3.4:8233");
     }
 }
 
