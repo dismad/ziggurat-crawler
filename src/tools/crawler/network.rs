@@ -38,8 +38,24 @@ pub struct KnownNode {
     pub services: Option<u64>,
     /// The number of subsequent connection errors.
     pub connection_failures: u8,
+    /// How many `getaddr` messages we have sent on the current connection.
+    pub getaddr_sent: u8,
+    /// True once this peer sent a usable `addr` / `addrv2` dump.
+    pub received_addr: bool,
     /// The node's state.
     pub state: ConnectionState,
+}
+
+impl KnownNode {
+    pub fn is_zebra_or_zakura(&self) -> bool {
+        self.user_agent
+            .as_ref()
+            .map(|ua| {
+                let s = &ua.0;
+                s.contains("Zebra") || s.contains("Zakura")
+            })
+            .unwrap_or(false)
+    }
 }
 
 /// The list of nodes and connections the crawler is aware of.
@@ -69,6 +85,24 @@ impl KnownNetwork {
     pub fn set_node_state(&self, addr: SocketAddr, state: ConnectionState) {
         if let Some(node) = self.nodes.write().get_mut(&addr) {
             node.state = state;
+            if state == ConnectionState::Disconnected {
+                node.getaddr_sent = 0;
+            }
+        }
+    }
+
+    pub fn mark_received_addr(&self, addr: SocketAddr) {
+        if let Some(node) = self.nodes.write().get_mut(&addr) {
+            node.received_addr = true;
+        }
+    }
+
+    pub fn bump_getaddr_sent(&self, addr: SocketAddr) -> u8 {
+        if let Some(node) = self.nodes.write().get_mut(&addr) {
+            node.getaddr_sent = node.getaddr_sent.saturating_add(1);
+            node.getaddr_sent
+        } else {
+            0
         }
     }
 

@@ -10,6 +10,7 @@ use pea2pea::{
     protocols::{Handshake, Reading, Writing},
     Config, Connection, ConnectionSide, Node as Pea2PeaNode, Pea2Pea,
 };
+use tokio::time::{sleep, Duration};
 use tokio_util::codec::Framed;
 use tracing::*;
 use ziggurat_zcash::{
@@ -28,6 +29,10 @@ pub const MAX_CONCURRENT_CONNECTIONS: u16 = 1200;
 pub const MAIN_LOOP_INTERVAL_SECS: u64 = 20;
 pub const RECONNECT_INTERVAL_SECS: u64 = 5 * 60;
 pub const MAX_WAIT_FOR_ADDR_SECS: u64 = 3 * 60;
+pub const MAX_CONNECTION_FAILURES: u8 = 5;
+pub const GETADDR_AFTER_VERSION_DELAY: Duration = Duration::from_secs(1);
+pub const GETADDR_RETRY_DELAY: Duration = Duration::from_secs(8);
+pub const MAX_GETADDR_PER_CONN: u8 = 2;
 
 /// Represents the crawler together with network metrics it has collected.
 #[derive(Clone)]
@@ -35,6 +40,7 @@ pub struct Crawler {
     node: Pea2PeaNode,
     pub known_network: Arc<KnownNetwork>,
     pub start_time: Instant,
+    pub start_height: i32,
 }
 
 impl Pea2Pea for Crawler {
@@ -45,7 +51,7 @@ impl Pea2Pea for Crawler {
 
 impl Crawler {
     /// Creates a new instance of the `Crawler` without starting it.
-    pub async fn new() -> Self {
+    pub async fn new(start_height: i32) -> Self {
         let config = Config {
             name: Some("crawler".into()),
             listener_ip: None,
@@ -57,6 +63,7 @@ impl Crawler {
             node: Pea2PeaNode::new(config),
             known_network: Default::default(),
             start_time: Instant::now(),
+            start_height,
         }
     }
 
@@ -75,6 +82,8 @@ impl Crawler {
                     known_node.last_connected = Some(timestamp);
                     known_node.handshake_time = Some(timestamp.elapsed());
                     known_node.state = ConnectionState::Connected;
+                    known_node.getaddr_sent = 0;
+                    known_node.received_addr = false;
                 }
                 Err(_) => {
                     trace!(parent: self.node().span(), "failed to connect to {}", addr);
@@ -88,15 +97,17 @@ impl Crawler {
 
     /// Checks to see if crawler should connect to the given address.
     pub fn should_connect(&self, addr: SocketAddr) -> bool {
-        if self.known_network.nodes().get(&addr).is_some() {
-            // Ensure that crawler is not exceeding the MAX_CONCURRENT_CONNECTIONS.
+        if let Some(node) = self.known_network.nodes().get(&addr) {
+            if node.connection_failures >= MAX_CONNECTION_FAILURES {
+                return false;
+            }
+
             if self.node().num_connected() + self.node().num_connecting()
                 >= MAX_CONCURRENT_CONNECTIONS.into()
             {
                 return false;
             }
 
-            // Ensure that there are no active connections with the given addr.
             if self.node().is_connected(addr) || self.node().is_connecting(addr) {
                 return false;
             }
@@ -106,12 +117,55 @@ impl Crawler {
             panic!("Logic bug! The crawler should only attempt to connect to known addresses.");
         }
     }
+
+    async fn request_peers(&self, addr: SocketAddr) {
+        let sent = self.known_network.bump_getaddr_sent(addr);
+        if sent == 0 || sent > MAX_GETADDR_PER_CONN {
+            return;
+        }
+        if let Ok(ok) = self.unicast(addr, Message::GetAddr) {
+            let _ = ok.await;
+        }
+    }
+
+    fn schedule_getaddr(&self, source: SocketAddr) {
+        let crawler = self.clone();
+        tokio::spawn(async move {
+            sleep(GETADDR_AFTER_VERSION_DELAY).await;
+            if !crawler.node().is_connected(source) {
+                return;
+            }
+            if crawler
+                .known_network
+                .nodes()
+                .get(&source)
+                .map(|n| n.received_addr || n.getaddr_sent >= MAX_GETADDR_PER_CONN)
+                .unwrap_or(true)
+            {
+                return;
+            }
+            crawler.request_peers(source).await;
+
+            sleep(GETADDR_RETRY_DELAY).await;
+            if !crawler.node().is_connected(source) {
+                return;
+            }
+            if crawler
+                .known_network
+                .nodes()
+                .get(&source)
+                .map(|n| n.received_addr || n.getaddr_sent >= MAX_GETADDR_PER_CONN)
+                .unwrap_or(true)
+            {
+                return;
+            }
+            crawler.request_peers(source).await;
+        });
+    }
 }
 
 #[async_trait::async_trait]
 impl Handshake for Crawler {
-    // Only needs to cover sending our version. Remote version is handled in
-    // process_message because Zebra can delay it for tens of seconds.
     const TIMEOUT_MS: u64 = 2_000;
 
     async fn perform_handshake(&self, mut conn: Connection) -> io::Result<Connection> {
@@ -119,12 +173,10 @@ impl Handshake for Crawler {
         let own_listening_addr: SocketAddr = ([127, 0, 0, 1], 0).into();
         let mut framed_stream = Framed::new(self.borrow_stream(&mut conn), MessageCodec::default());
 
-        let own_version = Message::Version(Version::new(conn_addr, own_listening_addr));
+        let own_version = Message::Version(
+            Version::new(conn_addr, own_listening_addr).with_start_height(self.start_height),
+        );
         framed_stream.send(own_version).await?;
-
-        // Here should be waiting for remote version message but as some nodes don't send it
-        // quickly enough we will wait for it in the process_message function.
-        // @see process_message function for more details.
 
         Ok(conn)
     }
@@ -152,10 +204,8 @@ impl Reading for Crawler {
                 info!(parent: self.node().span(), "got {} address(es) from {}", len, source);
 
                 self.known_network.add_addrs(source, &listening_addrs);
+                self.known_network.mark_received_addr(source);
 
-                // Disconnect after a real peer dump. Keep the socket only if the
-                // peer echoed solely its own address — a follow-up getaddr
-                // response may still arrive.
                 if len > 1 || (len == 1 && listening_addrs[0] != source) {
                     self.node().disconnect(source).await;
                     self.known_network
@@ -176,8 +226,18 @@ impl Reading for Crawler {
             Message::GetData(inv) => {
                 let _ = self.unicast(source, Message::NotFound(inv.clone()))?.await;
             }
+            Message::Verack => {
+                if self
+                    .known_network
+                    .nodes()
+                    .get(&source)
+                    .map(|n| n.getaddr_sent == 0 && !n.received_addr)
+                    .unwrap_or(false)
+                {
+                    self.request_peers(source).await;
+                }
+            }
             Message::Version(ver) => {
-                // Update source node with information from version.
                 if let Some(known_node) = self.known_network.nodes.write().get_mut(&source) {
                     known_node.protocol_version = Some(ver.version);
                     known_node.user_agent = Some(ver.user_agent);
@@ -186,12 +246,8 @@ impl Reading for Crawler {
                 }
 
                 let _ = self.unicast(source, Message::Verack)?.await;
-                // Advertise ZIP-155 support so Zebra/modern zcashd reply with
-                // addrv2 (and still accept classic addr).
                 let _ = self.unicast(source, Message::SendAddrV2)?.await;
-                // GetAddr only after we have their version. Sending it earlier
-                // is silently dropped and the 180s addr-wait then fires.
-                let _ = self.unicast(source, Message::GetAddr)?.await;
+                self.schedule_getaddr(source);
             }
             _ => {}
         }

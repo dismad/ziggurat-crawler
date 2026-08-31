@@ -57,6 +57,10 @@ struct Args {
     /// Default port used for connecting to the nodes
     #[clap(short, long, value_parser, default_value_t = ZCASH_P2P_DEFAULT_MAINNET_PORT)]
     node_listening_port: u16,
+
+    /// Advertised chain height in our version message (NU6.3 activation by default)
+    #[clap(long, value_parser, default_value_t = 3_428_143)]
+    start_height: i32,
     // TODO
     // #[clap(short, long, value_parser, default_value = "testnet")]
     // network: String,
@@ -143,7 +147,7 @@ async fn main() {
     let seed_addrs = parse_addrs(args.seed_addrs, args.node_listening_port);
 
     // Create the crawler with the given listener address.
-    let crawler = Crawler::new().await;
+    let crawler = Crawler::new(args.start_height).await;
 
     let mut network_metrics = NetworkMetrics::default();
     let summary_snapshot = Arc::new(Mutex::new(NetworkSummary::default()));
@@ -212,14 +216,14 @@ async fn main() {
                     }
                 })
             {
-                warn!(parent: crawler.node().span(), "disconnecting from node {} because it didn't send us proper addr message", addr);
+                warn!(parent: crawler.node().span(), "disconnecting from node {} after {}s with no addr dump", addr, MAX_WAIT_FOR_ADDR_SECS);
                 crawler.node().disconnect(addr).await;
                 crawler
                     .known_network
                     .set_node_state(addr, ConnectionState::Disconnected);
             }
 
-            for (addr, _) in crawler
+            let due: Vec<(SocketAddr, crate::network::KnownNode)> = crawler
                 .known_network
                 .nodes()
                 .into_iter()
@@ -230,13 +234,39 @@ async fn main() {
                         true
                     }
                 })
-                .choose_multiple(&mut rand::thread_rng(), NUM_CONN_ATTEMPTS_PERIODIC)
-            {
+                .collect();
+
+            let preferred: Vec<_> = due
+                .iter()
+                .filter(|(_, n)| n.is_zebra_or_zakura())
+                .cloned()
+                .collect();
+            let unknown: Vec<_> = due
+                .iter()
+                .filter(|(_, n)| n.user_agent.is_none())
+                .cloned()
+                .collect();
+            let other: Vec<_> = due
+                .iter()
+                .filter(|(_, n)| n.user_agent.is_some() && !n.is_zebra_or_zakura())
+                .cloned()
+                .collect();
+
+            let n_pref = NUM_CONN_ATTEMPTS_PERIODIC * 2 / 5;
+            let n_unknown = NUM_CONN_ATTEMPTS_PERIODIC * 2 / 5;
+            let mut chosen = {
+                let mut rng = rand::thread_rng();
+                let mut chosen = preferred.into_iter().choose_multiple(&mut rng, n_pref);
+                chosen.extend(unknown.into_iter().choose_multiple(&mut rng, n_unknown));
+                let remaining = NUM_CONN_ATTEMPTS_PERIODIC.saturating_sub(chosen.len());
+                chosen.extend(other.into_iter().choose_multiple(&mut rng, remaining));
+                chosen
+            };
+
+            for (addr, _) in chosen {
                 if crawler.should_connect(addr) {
                     let crawler_clone = crawler.clone();
                     tokio::spawn(async move {
-                        // Once the Version message is received in the process_message function,
-                        // GetAddr will be requested from the peer
                         let _ = crawler_clone.connect(addr).await;
                     });
                 }

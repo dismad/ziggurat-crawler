@@ -18,7 +18,10 @@ pub const MAGIC_TESTNET: [u8; MAGIC_LEN] = [0xfa, 0x1a, 0xf9, 0xbf];
 pub const MAGIC_MAINNET: [u8; MAGIC_LEN] = [0x24, 0xe9, 0x27, 0x64];
 
 /// Version message user agent
-pub const USER_AGENT: &str = "MagicBean:5.4.2";
+pub const USER_AGENT: &str = "/ZigguratCrawler:0.2.0/";
+/// NU6.3 / Ironwood activation height. Advertise at least this so peers
+/// do not treat the crawler as an unsynced IBD node.
+pub const DEFAULT_START_HEIGHT: i32 = 3_428_143;
 
 #[cfg(test)]
 pub const MAGIC: [u8; MAGIC_LEN] = MAGIC_TESTNET;
