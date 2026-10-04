@@ -241,7 +241,9 @@ async fn main() {
 
             // Once the Version message is received in the process_message function,
             // GetAddr will be requested from the peer
-            let _ = crawler_clone.connect(addr).await;
+            if let Err(e) = crawler_clone.connect(addr).await {
+                warn!(parent: crawler_clone.node().span(), "seed connect {addr} failed: {e}");
+            }
         });
     }
 
@@ -249,11 +251,20 @@ async fn main() {
     wait_until!(Duration::from_secs(3), crawler.node().num_connected() >= 1);
 
     // Wait for one of the seed nodes to respond with a list of addrs.
-    wait_until!(
-        Duration::from_millis(SEED_RESPONSE_TIMEOUT_MS),
-        crawler.known_network.nodes().len() > seed_addrs.len(),
-        Duration::from_millis(SEED_WAIT_LOOP_INTERVAL_MS)
-    );
+    // A silent seed set used to abort the process; keep crawling the seeds we have.
+    let seed_wait_started = Instant::now();
+    while crawler.known_network.nodes().len() <= seed_addrs.len()
+        && seed_wait_started.elapsed() < Duration::from_millis(SEED_RESPONSE_TIMEOUT_MS)
+    {
+        sleep(Duration::from_millis(SEED_WAIT_LOOP_INTERVAL_MS)).await;
+    }
+    if crawler.known_network.nodes().len() <= seed_addrs.len() {
+        warn!(
+            "no seed returned addrs ({}/{} known); continuing",
+            crawler.known_network.num_nodes(),
+            seed_addrs.len()
+        );
+    }
 
     let crawler_clone = crawler.clone();
     let crawling_loop_task = tokio::spawn(async move {
