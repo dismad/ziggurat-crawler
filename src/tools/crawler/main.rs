@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use dns_lookup::lookup_host;
 use parking_lot::Mutex;
 use pea2pea::{
@@ -17,10 +17,14 @@ use tokio::{signal, time::sleep};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 use ziggurat_core_crawler::summary::NetworkSummary;
+use ziggurat_zcash::protocol::message::constants::{
+    self, MAGIC_MAINNET, MAGIC_TESTNET, NU6_3_MAINNET_ACTIVATION_HEIGHT, NU6_3_PROTOCOL_VERSION,
+    NU7_TESTNET_ACTIVATION_HEIGHT, NU7_TESTNET_PROTOCOL_VERSION,
+};
 use ziggurat_zcash::wait_until;
 
 use crate::{
-    metrics::{NetworkMetrics, ZCASH_P2P_DEFAULT_MAINNET_PORT},
+    metrics::{NetworkMetrics, ZCASH_P2P_DEFAULT_MAINNET_PORT, ZCASH_P2P_DEFAULT_TESTNET_PORT},
     network::{ConnectionState, KnownNode},
     protocol::{
         Crawler, MAIN_LOOP_INTERVAL_SECS, MAX_WAIT_FOR_ADDR_SECS, NUM_CONN_ATTEMPTS_PERIODIC,
@@ -41,6 +45,43 @@ const SUMMARY_LOOP_INTERVAL: u64 = 60;
 const LOG_PATH: &str = "crawler-log.txt";
 const TARGETS_PATH: &str = "crawler-targets.txt";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Network {
+    Mainnet,
+    Testnet,
+}
+
+impl Network {
+    fn magic(self) -> [u8; 4] {
+        match self {
+            Self::Mainnet => MAGIC_MAINNET,
+            Self::Testnet => MAGIC_TESTNET,
+        }
+    }
+
+    fn protocol_version(self) -> u32 {
+        match self {
+            // Mainnet NU7 minimum is 170190, but the activation height is unassigned.
+            Self::Mainnet => NU6_3_PROTOCOL_VERSION,
+            Self::Testnet => NU7_TESTNET_PROTOCOL_VERSION,
+        }
+    }
+
+    fn start_height(self) -> i32 {
+        match self {
+            Self::Mainnet => NU6_3_MAINNET_ACTIVATION_HEIGHT,
+            Self::Testnet => NU7_TESTNET_ACTIVATION_HEIGHT,
+        }
+    }
+
+    fn default_port(self) -> u16 {
+        match self {
+            Self::Mainnet => ZCASH_P2P_DEFAULT_MAINNET_PORT,
+            Self::Testnet => ZCASH_P2P_DEFAULT_TESTNET_PORT,
+        }
+    }
+}
+
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
@@ -56,16 +97,21 @@ struct Args {
     #[clap(short, long, value_parser)]
     rpc_addr: Option<SocketAddr>,
 
-    /// Default port used for connecting to the nodes
-    #[clap(short, long, value_parser, default_value_t = ZCASH_P2P_DEFAULT_MAINNET_PORT)]
-    node_listening_port: u16,
+    /// Default port used for connecting to the nodes. Mainnet 8233, Testnet 18233.
+    #[clap(short, long, value_parser)]
+    node_listening_port: Option<u16>,
 
-    /// Advertised chain height in our version message (NU6.3 activation by default)
-    #[clap(long, value_parser, default_value_t = 3_428_143)]
-    start_height: i32,
-    // TODO
-    // #[clap(short, long, value_parser, default_value = "testnet")]
-    // network: String,
+    /// Advertised chain height. Mainnet defaults to NU6.3 activation, Testnet to NU7 activation.
+    #[clap(long, value_parser)]
+    start_height: Option<i32>,
+
+    /// Advertised protocol version. Mainnet defaults to 170160, Testnet to 170180.
+    #[clap(long, value_parser)]
+    protocol_version: Option<u32>,
+
+    /// Mainnet stays on NU6.3. Testnet advertises the NU7 handshake.
+    #[clap(long, value_enum, default_value_t = Network::Mainnet)]
+    network: Network,
 }
 
 fn start_logger(default_level: LevelFilter) {
@@ -146,10 +192,25 @@ fn parse_addrs(seed_addrs: Vec<String>, node_listening_port: u16) -> Vec<SocketA
 async fn main() {
     start_logger(LevelFilter::INFO);
     let args = Args::parse();
-    let seed_addrs = parse_addrs(args.seed_addrs, args.node_listening_port);
+    let node_listening_port = args
+        .node_listening_port
+        .unwrap_or_else(|| args.network.default_port());
+    let start_height = args
+        .start_height
+        .unwrap_or_else(|| args.network.start_height());
+    let protocol_version = args
+        .protocol_version
+        .unwrap_or_else(|| args.network.protocol_version());
+    constants::set_network_magic(args.network.magic());
+    info!(
+        "network={:?} protocol={protocol_version} height={start_height} port={node_listening_port}",
+        args.network
+    );
+
+    let seed_addrs = parse_addrs(args.seed_addrs, node_listening_port);
 
     // Create the crawler with the given listener address.
-    let crawler = Crawler::new(args.start_height).await;
+    let crawler = Crawler::new(start_height, protocol_version).await;
 
     let mut network_metrics = NetworkMetrics::default();
     let summary_snapshot = Arc::new(Mutex::new(NetworkSummary::default()));

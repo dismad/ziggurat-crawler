@@ -41,6 +41,7 @@ pub struct Crawler {
     pub known_network: Arc<KnownNetwork>,
     pub start_time: Instant,
     pub start_height: i32,
+    pub protocol_version: u32,
 }
 
 impl Pea2Pea for Crawler {
@@ -51,7 +52,7 @@ impl Pea2Pea for Crawler {
 
 impl Crawler {
     /// Creates a new instance of the `Crawler` without starting it.
-    pub async fn new(start_height: i32) -> Self {
+    pub async fn new(start_height: i32, protocol_version: u32) -> Self {
         let config = Config {
             name: Some("crawler".into()),
             listener_ip: None,
@@ -64,6 +65,7 @@ impl Crawler {
             known_network: Default::default(),
             start_time: Instant::now(),
             start_height,
+            protocol_version,
         }
     }
 
@@ -174,7 +176,9 @@ impl Handshake for Crawler {
         let mut framed_stream = Framed::new(self.borrow_stream(&mut conn), MessageCodec::default());
 
         let own_version = Message::Version(
-            Version::new(conn_addr, own_listening_addr).with_start_height(self.start_height),
+            Version::new(conn_addr, own_listening_addr)
+                .with_version(self.protocol_version)
+                .with_start_height(self.start_height),
         );
         framed_stream.send(own_version).await?;
 

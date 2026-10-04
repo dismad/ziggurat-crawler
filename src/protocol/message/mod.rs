@@ -63,7 +63,7 @@ impl MessageHeader {
     /// Returns a `MessageHeader` constructed from the message body.
     pub fn new(command: [u8; COMMAND_LEN], body: &[u8]) -> Self {
         MessageHeader {
-            magic: MAGIC,
+            magic: constants::network_magic(),
             command,
             body_length: body.len() as u32,
             checksum: checksum(body),
