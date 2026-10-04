@@ -33,11 +33,13 @@ mod metrics;
 mod network;
 mod protocol;
 mod rpc;
+mod user_agent;
 
 const SEED_WAIT_LOOP_INTERVAL_MS: u64 = 500;
 const SEED_RESPONSE_TIMEOUT_MS: u64 = 120_000;
 const SUMMARY_LOOP_INTERVAL: u64 = 60;
 const LOG_PATH: &str = "crawler-log.txt";
+const TARGETS_PATH: &str = "crawler-targets.txt";
 
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
@@ -236,9 +238,32 @@ async fn main() {
                 })
                 .collect();
 
+            let targets = user_agent::TargetSet::from_nodes(
+                crawler.known_network.nodes().iter().map(|(a, n)| (a, n)),
+            );
+            let report = targets.report();
+            info!(parent: crawler.node().span(), "{report}");
+            if let Err(e) = std::fs::write(TARGETS_PATH, format!("{report}\n")) {
+                warn!(parent: crawler.node().span(), "couldn't write {TARGETS_PATH}: {e}");
+            }
+            let newest_zakura = targets.newest_zakura;
+
+            let is_target = |n: &crate::network::KnownNode| {
+                if n.is_zebra_7_plus() {
+                    return true;
+                }
+                match (n.impl_version(), newest_zakura) {
+                    (Some((user_agent::ImplKind::Zakura, version)), Some(newest)) => {
+                        version == newest
+                    }
+                    (Some((user_agent::ImplKind::Zakura, _)), None) => true,
+                    _ => false,
+                }
+            };
+            let target: Vec<_> = due.iter().filter(|(_, n)| is_target(n)).cloned().collect();
             let preferred: Vec<_> = due
                 .iter()
-                .filter(|(_, n)| n.is_zebra_or_zakura())
+                .filter(|(_, n)| n.is_zebra_or_zakura() && !is_target(n))
                 .cloned()
                 .collect();
             let unknown: Vec<_> = due
@@ -252,14 +277,18 @@ async fn main() {
                 .cloned()
                 .collect();
 
-            let n_pref = NUM_CONN_ATTEMPTS_PERIODIC * 2 / 5;
-            let n_unknown = NUM_CONN_ATTEMPTS_PERIODIC * 2 / 5;
-            let mut chosen = {
+            let chosen = {
+                let mut chosen = Vec::new();
                 let mut rng = rand::thread_rng();
-                let mut chosen = preferred.into_iter().choose_multiple(&mut rng, n_pref);
-                chosen.extend(unknown.into_iter().choose_multiple(&mut rng, n_unknown));
-                let remaining = NUM_CONN_ATTEMPTS_PERIODIC.saturating_sub(chosen.len());
-                chosen.extend(other.into_iter().choose_multiple(&mut rng, remaining));
+                let mut take = |bucket: Vec<(SocketAddr, crate::network::KnownNode)>,
+                                want: usize| {
+                    let room = NUM_CONN_ATTEMPTS_PERIODIC.saturating_sub(chosen.len());
+                    chosen.extend(bucket.into_iter().choose_multiple(&mut rng, want.min(room)));
+                };
+                take(target, NUM_CONN_ATTEMPTS_PERIODIC / 2);
+                take(preferred, NUM_CONN_ATTEMPTS_PERIODIC / 5);
+                take(unknown, NUM_CONN_ATTEMPTS_PERIODIC / 5);
+                take(other, NUM_CONN_ATTEMPTS_PERIODIC);
                 chosen
             };
 
@@ -337,7 +366,7 @@ mod tests {
             String::from("127.0.0.1"),
             String::from("192.0.2.235:54321"),
         ];
-        let parsed_addrs = parse_addrs(addrs);
+        let parsed_addrs = parse_addrs(addrs, ZCASH_P2P_DEFAULT_MAINNET_PORT);
 
         let correct_addrs = vec![
             SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 12345),

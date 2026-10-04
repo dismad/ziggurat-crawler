@@ -47,14 +47,23 @@ pub struct KnownNode {
 }
 
 impl KnownNode {
-    pub fn is_zebra_or_zakura(&self) -> bool {
+    /// Parsed Zebra or Zakura identity from the version user agent.
+    pub fn impl_version(
+        &self,
+    ) -> Option<(crate::user_agent::ImplKind, crate::user_agent::NodeVersion)> {
         self.user_agent
             .as_ref()
-            .map(|ua| {
-                let s = &ua.0;
-                s.contains("Zebra") || s.contains("Zakura")
-            })
-            .unwrap_or(false)
+            .and_then(|ua| crate::user_agent::classify(&ua.0))
+    }
+
+    pub fn is_zebra_or_zakura(&self) -> bool {
+        self.impl_version().is_some()
+    }
+
+    /// Zebra 7.x and anything newer. Older Zebra stays in the general preferred bucket.
+    pub fn is_zebra_7_plus(&self) -> bool {
+        self.impl_version()
+            .is_some_and(|(kind, version)| crate::user_agent::is_zebra_at_least_7(kind, version))
     }
 }
 
