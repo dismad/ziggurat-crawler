@@ -247,8 +247,15 @@ async fn main() {
         });
     }
 
-    // Wait for a single successful connection before proceeding.
-    wait_until!(Duration::from_secs(3), crawler.node().num_connected() >= 1);
+    // Wait briefly for at least one live connection, then continue anyway.
+    // Immediate RSTs from seeds are normal; a hard 3s timeout used to abort startup.
+    let connect_deadline = Instant::now() + Duration::from_secs(15);
+    while crawler.node().num_connected() == 0 && Instant::now() < connect_deadline {
+        sleep(Duration::from_millis(200)).await;
+    }
+    if crawler.node().num_connected() == 0 {
+        warn!("no connections after seed dial; continuing with known seeds");
+    }
 
     // Wait for one of the seed nodes to respond with a list of addrs.
     // A silent seed set used to abort the process; keep crawling the seeds we have.
