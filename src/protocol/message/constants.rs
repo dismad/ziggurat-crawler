@@ -13,25 +13,31 @@ pub const MAX_MESSAGE_LEN: usize = 2 * 1024 * 1024;
 
 /// The current network protocol version number.
 ///
-/// Mainnet is still NU6.3. ZIP 204 assigns NU7 minimums of 170180 on Testnet
-/// and 170190 on Mainnet, but the Mainnet activation height is not assigned.
-/// Do not advertise 170190 on Mainnet until that height is published.
+/// NU7 is active on Mainnet (activation height 3_543_405) and Testnet.
+/// ZIP 204: Mainnet minimum 170190, Testnet minimum 170180.
 pub const NU6_3_PROTOCOL_VERSION: u32 = 170_160;
-pub const PROTOCOL_VERSION: u32 = NU6_3_PROTOCOL_VERSION;
 pub const NU7_TESTNET_PROTOCOL_VERSION: u32 = 170_180;
 pub const NU7_MAINNET_PROTOCOL_VERSION: u32 = 170_190;
+/// Default protocol version (NU7 Mainnet).
+pub const PROTOCOL_VERSION: u32 = NU7_MAINNET_PROTOCOL_VERSION;
+
 /// The current network version identifier.
 pub const MAGIC_TESTNET: [u8; MAGIC_LEN] = [0xfa, 0x1a, 0xf9, 0xbf];
 pub const MAGIC_MAINNET: [u8; MAGIC_LEN] = [0x24, 0xe9, 0x27, 0x64];
 
 /// Version message user agent
 pub const USER_AGENT: &str = "/ZigguratCrawler:0.2.0/";
-/// NU6.3 / Ironwood activation height. Advertise at least this so peers
-/// do not treat the crawler as an unsynced IBD node.
+
+/// NU6.3 / Ironwood activation height (Mainnet).
 pub const NU6_3_MAINNET_ACTIVATION_HEIGHT: i32 = 3_428_143;
-pub const DEFAULT_START_HEIGHT: i32 = NU6_3_MAINNET_ACTIVATION_HEIGHT;
-/// Public Testnet NU7 activation height (ZIP 259 / Zebra 7.0.0-rc.0).
+
+/// NU7 activation heights (ZIP 259).
+pub const NU7_MAINNET_ACTIVATION_HEIGHT: i32 = 3_543_405;
 pub const NU7_TESTNET_ACTIVATION_HEIGHT: i32 = 4_465_026;
+
+/// Default advertised start height (NU7 Mainnet activation).
+/// Peers treat lower heights as unsynced IBD nodes.
+pub const DEFAULT_START_HEIGHT: i32 = NU7_MAINNET_ACTIVATION_HEIGHT;
 
 #[cfg(test)]
 pub const MAGIC: [u8; MAGIC_LEN] = MAGIC_TESTNET;

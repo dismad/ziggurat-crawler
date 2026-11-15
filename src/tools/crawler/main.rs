@@ -18,7 +18,8 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 use ziggurat_core_crawler::summary::NetworkSummary;
 use ziggurat_zcash::protocol::message::constants::{
-    self, MAGIC_MAINNET, MAGIC_TESTNET, NU6_3_MAINNET_ACTIVATION_HEIGHT, NU6_3_PROTOCOL_VERSION,
+    self, MAGIC_MAINNET, MAGIC_TESTNET,
+    NU7_MAINNET_ACTIVATION_HEIGHT, NU7_MAINNET_PROTOCOL_VERSION,
     NU7_TESTNET_ACTIVATION_HEIGHT, NU7_TESTNET_PROTOCOL_VERSION,
 };
 use ziggurat_zcash::wait_until;
@@ -61,16 +62,15 @@ impl Network {
 
     fn protocol_version(self) -> u32 {
         match self {
-            // Mainnet NU7 minimum is 170190, but the activation height is unassigned.
-            Self::Mainnet => NU6_3_PROTOCOL_VERSION,
-            Self::Testnet => NU7_TESTNET_PROTOCOL_VERSION,
+            Self::Mainnet => NU7_MAINNET_PROTOCOL_VERSION, // 170190
+            Self::Testnet => NU7_TESTNET_PROTOCOL_VERSION, // 170180
         }
     }
 
     fn start_height(self) -> i32 {
         match self {
-            Self::Mainnet => NU6_3_MAINNET_ACTIVATION_HEIGHT,
-            Self::Testnet => NU7_TESTNET_ACTIVATION_HEIGHT,
+            Self::Mainnet => NU7_MAINNET_ACTIVATION_HEIGHT, // 3_543_405
+            Self::Testnet => NU7_TESTNET_ACTIVATION_HEIGHT, // 4_465_026
         }
     }
 
@@ -101,15 +101,15 @@ struct Args {
     #[clap(short, long, value_parser)]
     node_listening_port: Option<u16>,
 
-    /// Advertised chain height. Mainnet defaults to NU6.3 activation, Testnet to NU7 activation.
+    /// Advertised chain height. Mainnet defaults to NU7 activation (3_543_405), Testnet to NU7 activation (4_465_026).
     #[clap(long, value_parser)]
     start_height: Option<i32>,
 
-    /// Advertised protocol version. Mainnet defaults to 170160, Testnet to 170180.
+    /// Advertised protocol version. Mainnet defaults to 170190, Testnet to 170180.
     #[clap(long, value_parser)]
     protocol_version: Option<u32>,
 
-    /// Mainnet stays on NU6.3. Testnet advertises the NU7 handshake.
+    /// Network to crawl. Mainnet and Testnet both advertise the NU7 handshake.
     #[clap(long, value_enum, default_value_t = Network::Mainnet)]
     network: Network,
 }
