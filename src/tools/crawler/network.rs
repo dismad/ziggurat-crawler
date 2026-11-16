@@ -42,6 +42,10 @@ pub struct KnownNode {
     pub getaddr_sent: u8,
     /// True once this peer sent a usable `addr` / `addrv2` dump.
     pub received_addr: bool,
+    /// When set, the peer is skipped until this instant (non-seeds only).
+    pub backoff_until: Option<Instant>,
+    /// True for addresses that came from the initial seed list.
+    pub is_seed: bool,
     /// The node's state.
     pub state: ConnectionState,
 }

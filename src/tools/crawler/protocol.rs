@@ -30,6 +30,9 @@ pub const MAIN_LOOP_INTERVAL_SECS: u64 = 20;
 pub const RECONNECT_INTERVAL_SECS: u64 = 5 * 60;
 pub const MAX_WAIT_FOR_ADDR_SECS: u64 = 3 * 60;
 pub const MAX_CONNECTION_FAILURES: u8 = 5;
+/// After this many consecutive failures the peer is skipped until the backoff expires.
+/// Seeds are exempt and stay eligible.
+pub const CONNECTION_FAILURE_BACKOFF: Duration = Duration::from_secs(30 * 60);
 pub const GETADDR_AFTER_VERSION_DELAY: Duration = Duration::from_secs(1);
 pub const GETADDR_RETRY_DELAY: Duration = Duration::from_secs(8);
 pub const MAX_GETADDR_PER_CONN: u8 = 2;
@@ -81,6 +84,7 @@ impl Crawler {
             match result {
                 Ok(_) => {
                     known_node.connection_failures = 0;
+                    known_node.backoff_until = None;
                     known_node.last_connected = Some(timestamp);
                     known_node.handshake_time = Some(timestamp.elapsed());
                     known_node.state = ConnectionState::Connected;
@@ -89,7 +93,12 @@ impl Crawler {
                 }
                 Err(_) => {
                     trace!(parent: self.node().span(), "failed to connect to {}", addr);
-                    known_node.connection_failures += 1;
+                    known_node.connection_failures = known_node.connection_failures.saturating_add(1);
+                    if !known_node.is_seed
+                        && known_node.connection_failures >= MAX_CONNECTION_FAILURES
+                    {
+                        known_node.backoff_until = Some(Instant::now() + CONNECTION_FAILURE_BACKOFF);
+                    }
                 }
             }
         }
@@ -100,8 +109,13 @@ impl Crawler {
     /// Checks to see if crawler should connect to the given address.
     pub fn should_connect(&self, addr: SocketAddr) -> bool {
         if let Some(node) = self.known_network.nodes().get(&addr) {
-            if node.connection_failures >= MAX_CONNECTION_FAILURES {
-                return false;
+            // Seeds stay eligible. Other peers enter a backoff after repeated failures.
+            if !node.is_seed {
+                if let Some(until) = node.backoff_until {
+                    if Instant::now() < until {
+                        return false;
+                    }
+                }
             }
 
             if self.node().num_connected() + self.node().num_connecting()
@@ -208,9 +222,14 @@ impl Reading for Crawler {
                 info!(parent: self.node().span(), "got {} address(es) from {}", len, source);
 
                 self.known_network.add_addrs(source, &listening_addrs);
-                self.known_network.mark_received_addr(source);
+                // Only a real dump (not Zebra's 1-entry self-announcement or a
+                // fully-filtered addrv2) should stop further getaddr attempts.
+                let is_dump = len > 1 || (len == 1 && listening_addrs[0] != source);
+                if is_dump {
+                    self.known_network.mark_received_addr(source);
+                }
 
-                if len > 1 || (len == 1 && listening_addrs[0] != source) {
+                if is_dump {
                     self.node().disconnect(source).await;
                     self.known_network
                         .set_node_state(source, ConnectionState::Disconnected);
@@ -231,15 +250,7 @@ impl Reading for Crawler {
                 let _ = self.unicast(source, Message::NotFound(inv.clone()))?.await;
             }
             Message::Verack => {
-                if self
-                    .known_network
-                    .nodes()
-                    .get(&source)
-                    .map(|n| n.getaddr_sent == 0 && !n.received_addr)
-                    .unwrap_or(false)
-                {
-                    self.request_peers(source).await;
-                }
+                // getaddr is scheduled from Version so the 1s + 8s retry can both fire.
             }
             Message::Version(ver) => {
                 if let Some(known_node) = self.known_network.nodes.write().get_mut(&source) {
@@ -249,8 +260,9 @@ impl Reading for Crawler {
                     known_node.start_height = Some(ver.start_height);
                 }
 
-                let _ = self.unicast(source, Message::Verack)?.await;
+                // ZIP-155: sendaddrv2 must precede verack or the peer ignores it.
                 let _ = self.unicast(source, Message::SendAddrV2)?.await;
+                let _ = self.unicast(source, Message::Verack)?.await;
                 self.schedule_getaddr(source);
             }
             _ => {}

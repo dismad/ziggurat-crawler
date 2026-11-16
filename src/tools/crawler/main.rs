@@ -233,11 +233,13 @@ async fn main() {
         let addr = *addr;
 
         tokio::spawn(async move {
+            let mut node = KnownNode::default();
+            node.is_seed = true;
             crawler_clone
                 .known_network
                 .nodes
                 .write()
-                .insert(addr, KnownNode::default());
+                .insert(addr, node);
 
             // Once the Version message is received in the process_message function,
             // GetAddr will be requested from the peer
@@ -308,12 +310,13 @@ async fn main() {
                 .known_network
                 .nodes()
                 .into_iter()
-                .filter(|(_, node)| {
-                    if let Some(i) = node.last_connected {
+                .filter(|(addr, node)| {
+                    let reconnect_due = if let Some(i) = node.last_connected {
                         i.elapsed().as_secs() >= RECONNECT_INTERVAL_SECS
                     } else {
                         true
-                    }
+                    };
+                    reconnect_due && crawler.should_connect(*addr)
                 })
                 .collect();
 
@@ -366,7 +369,8 @@ async fn main() {
                 };
                 take(target, NUM_CONN_ATTEMPTS_PERIODIC / 2);
                 take(preferred, NUM_CONN_ATTEMPTS_PERIODIC / 5);
-                take(unknown, NUM_CONN_ATTEMPTS_PERIODIC / 5);
+                // Leftover goes to unknown (new) peers first so early discovery is not starved.
+                take(unknown, NUM_CONN_ATTEMPTS_PERIODIC);
                 take(other, NUM_CONN_ATTEMPTS_PERIODIC);
                 chosen
             };
