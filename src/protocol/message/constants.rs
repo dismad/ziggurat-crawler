@@ -12,13 +12,32 @@ pub const HEADER_LEN: usize = 24;
 pub const MAX_MESSAGE_LEN: usize = 2 * 1024 * 1024;
 
 /// The current network protocol version number.
-pub const PROTOCOL_VERSION: u32 = 170_160;
+///
+/// NU7 is active on Mainnet (activation height 3_543_405) and Testnet.
+/// ZIP 204: Mainnet minimum 170190, Testnet minimum 170180.
+pub const NU6_3_PROTOCOL_VERSION: u32 = 170_160;
+pub const NU7_TESTNET_PROTOCOL_VERSION: u32 = 170_180;
+pub const NU7_MAINNET_PROTOCOL_VERSION: u32 = 170_190;
+/// Default protocol version (NU7 Mainnet).
+pub const PROTOCOL_VERSION: u32 = NU7_MAINNET_PROTOCOL_VERSION;
+
 /// The current network version identifier.
 pub const MAGIC_TESTNET: [u8; MAGIC_LEN] = [0xfa, 0x1a, 0xf9, 0xbf];
 pub const MAGIC_MAINNET: [u8; MAGIC_LEN] = [0x24, 0xe9, 0x27, 0x64];
 
 /// Version message user agent
-pub const USER_AGENT: &str = "MagicBean:5.4.2";
+pub const USER_AGENT: &str = "/ZigguratCrawler:0.2.0/";
+
+/// NU6.3 / Ironwood activation height (Mainnet).
+pub const NU6_3_MAINNET_ACTIVATION_HEIGHT: i32 = 3_428_143;
+
+/// NU7 activation heights (ZIP 259).
+pub const NU7_MAINNET_ACTIVATION_HEIGHT: i32 = 3_543_405;
+pub const NU7_TESTNET_ACTIVATION_HEIGHT: i32 = 4_465_026;
+
+/// Default advertised start height (NU7 Mainnet activation).
+/// Peers treat lower heights as unsynced IBD nodes.
+pub const DEFAULT_START_HEIGHT: i32 = NU7_MAINNET_ACTIVATION_HEIGHT;
 
 #[cfg(test)]
 pub const MAGIC: [u8; MAGIC_LEN] = MAGIC_TESTNET;
@@ -26,6 +45,20 @@ pub const MAGIC: [u8; MAGIC_LEN] = MAGIC_TESTNET;
 pub const MAGIC: [u8; MAGIC_LEN] = MAGIC_MAINNET;
 #[cfg(all(not(test), feature = "crawler"))]
 pub const MAGIC: [u8; MAGIC_LEN] = MAGIC_MAINNET;
+
+use std::sync::OnceLock;
+
+static NETWORK_MAGIC_OVERRIDE: OnceLock<[u8; MAGIC_LEN]> = OnceLock::new();
+
+/// Selects the magic written on outbound crawler frames. Inbound decode already
+/// accepts the header magic as sent. Unset means the compile-time `MAGIC`.
+pub fn set_network_magic(magic: [u8; MAGIC_LEN]) {
+    let _ = NETWORK_MAGIC_OVERRIDE.set(magic);
+}
+
+pub fn network_magic() -> [u8; MAGIC_LEN] {
+    NETWORK_MAGIC_OVERRIDE.get().copied().unwrap_or(MAGIC)
+}
 
 pub const COMMAND_LEN: usize = 12;
 
@@ -50,3 +83,11 @@ pub const FILTERLOAD_COMMAND: [u8; COMMAND_LEN] = *b"filterload\0\0";
 pub const FILTERADD_COMMAND: [u8; COMMAND_LEN] = *b"filteradd\0\0\0";
 pub const FILTERCLEAR_COMMAND: [u8; COMMAND_LEN] = *b"filterclear\0";
 pub const ALERT_COMMAND: [u8; COMMAND_LEN] = *b"alert\0\0\0\0\0\0\0";
+// Bitcoin-inherited / ZIP-155 commands seen on live Zcash peers.
+// Unknown commands must be ignored, not treated as a decode error.
+pub const SENDHEADERS_COMMAND: [u8; COMMAND_LEN] = *b"sendheaders\0";
+pub const SENDADDRV2_COMMAND: [u8; COMMAND_LEN] = *b"sendaddrv2\0\0";
+pub const ADDRV2_COMMAND: [u8; COMMAND_LEN] = *b"addrv2\0\0\0\0\0\0";
+pub const SENDCMPCT_COMMAND: [u8; COMMAND_LEN] = *b"sendcmpct\0\0\0";
+pub const FEEFILTER_COMMAND: [u8; COMMAND_LEN] = *b"feefilter\0\0\0";
+pub const WTXIDRELAY_COMMAND: [u8; COMMAND_LEN] = *b"wtxidrelay\0\0";

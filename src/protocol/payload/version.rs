@@ -55,7 +55,6 @@ impl Version {
                 addr: addr_from,
             },
             nonce: Nonce::default(),
-            // Let's pretend to be a ZCashd node 5.4.2
             user_agent: VarStr(String::from(USER_AGENT)),
             start_height: 0,
             relay: false,
@@ -65,6 +64,12 @@ impl Version {
     /// Sets the protocol version.
     pub fn with_version(mut self, version: u32) -> Self {
         self.version = ProtocolVersion(version);
+        self
+    }
+
+    /// Sets the advertised chain height so peers do not treat the crawler as IBD.
+    pub fn with_start_height(mut self, start_height: i32) -> Self {
+        self.start_height = start_height;
         self
     }
 }
@@ -98,7 +103,12 @@ impl Codec for Version {
         let user_agent = VarStr::decode(bytes)?;
 
         let start_height = i32::from_le_bytes(read_n_bytes(bytes)?);
-        let relay = u8::from_le_bytes(read_n_bytes(bytes)?) != 0;
+        // BIP37 `relay` is optional on older version payloads.
+        let relay = if bytes.remaining() > 0 {
+            u8::from_le_bytes(read_n_bytes(bytes)?) != 0
+        } else {
+            false
+        };
 
         Ok(Self {
             version,

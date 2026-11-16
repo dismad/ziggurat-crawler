@@ -5,7 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use dns_lookup::lookup_host;
 use parking_lot::Mutex;
 use pea2pea::{
@@ -17,10 +17,15 @@ use tokio::{signal, time::sleep};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
 use ziggurat_core_crawler::summary::NetworkSummary;
+use ziggurat_zcash::protocol::message::constants::{
+    self, MAGIC_MAINNET, MAGIC_TESTNET,
+    NU7_MAINNET_ACTIVATION_HEIGHT, NU7_MAINNET_PROTOCOL_VERSION,
+    NU7_TESTNET_ACTIVATION_HEIGHT, NU7_TESTNET_PROTOCOL_VERSION,
+};
 use ziggurat_zcash::wait_until;
 
 use crate::{
-    metrics::{NetworkMetrics, ZCASH_P2P_DEFAULT_MAINNET_PORT},
+    metrics::{NetworkMetrics, ZCASH_P2P_DEFAULT_MAINNET_PORT, ZCASH_P2P_DEFAULT_TESTNET_PORT},
     network::{ConnectionState, KnownNode},
     protocol::{
         Crawler, MAIN_LOOP_INTERVAL_SECS, MAX_WAIT_FOR_ADDR_SECS, NUM_CONN_ATTEMPTS_PERIODIC,
@@ -33,11 +38,49 @@ mod metrics;
 mod network;
 mod protocol;
 mod rpc;
+mod user_agent;
 
 const SEED_WAIT_LOOP_INTERVAL_MS: u64 = 500;
 const SEED_RESPONSE_TIMEOUT_MS: u64 = 120_000;
 const SUMMARY_LOOP_INTERVAL: u64 = 60;
 const LOG_PATH: &str = "crawler-log.txt";
+const TARGETS_PATH: &str = "crawler-targets.txt";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Network {
+    Mainnet,
+    Testnet,
+}
+
+impl Network {
+    fn magic(self) -> [u8; 4] {
+        match self {
+            Self::Mainnet => MAGIC_MAINNET,
+            Self::Testnet => MAGIC_TESTNET,
+        }
+    }
+
+    fn protocol_version(self) -> u32 {
+        match self {
+            Self::Mainnet => NU7_MAINNET_PROTOCOL_VERSION, // 170190
+            Self::Testnet => NU7_TESTNET_PROTOCOL_VERSION, // 170180
+        }
+    }
+
+    fn start_height(self) -> i32 {
+        match self {
+            Self::Mainnet => NU7_MAINNET_ACTIVATION_HEIGHT, // 3_543_405
+            Self::Testnet => NU7_TESTNET_ACTIVATION_HEIGHT, // 4_465_026
+        }
+    }
+
+    fn default_port(self) -> u16 {
+        match self {
+            Self::Mainnet => ZCASH_P2P_DEFAULT_MAINNET_PORT,
+            Self::Testnet => ZCASH_P2P_DEFAULT_TESTNET_PORT,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[clap(author, version, about, long_about = None)]
@@ -54,12 +97,21 @@ struct Args {
     #[clap(short, long, value_parser)]
     rpc_addr: Option<SocketAddr>,
 
-    /// Default port used for connecting to the nodes
-    #[clap(short, long, value_parser, default_value_t = ZCASH_P2P_DEFAULT_MAINNET_PORT)]
-    node_listening_port: u16,
-    // TODO
-    // #[clap(short, long, value_parser, default_value = "testnet")]
-    // network: String,
+    /// Default port used for connecting to the nodes. Mainnet 8233, Testnet 18233.
+    #[clap(short, long, value_parser)]
+    node_listening_port: Option<u16>,
+
+    /// Advertised chain height. Mainnet defaults to NU7 activation (3_543_405), Testnet to NU7 activation (4_465_026).
+    #[clap(long, value_parser)]
+    start_height: Option<i32>,
+
+    /// Advertised protocol version. Mainnet defaults to 170190, Testnet to 170180.
+    #[clap(long, value_parser)]
+    protocol_version: Option<u32>,
+
+    /// Network to crawl. Mainnet and Testnet both advertise the NU7 handshake.
+    #[clap(long, value_enum, default_value_t = Network::Mainnet)]
+    network: Network,
 }
 
 fn start_logger(default_level: LevelFilter) {
@@ -140,10 +192,25 @@ fn parse_addrs(seed_addrs: Vec<String>, node_listening_port: u16) -> Vec<SocketA
 async fn main() {
     start_logger(LevelFilter::INFO);
     let args = Args::parse();
-    let seed_addrs = parse_addrs(args.seed_addrs, args.node_listening_port);
+    let node_listening_port = args
+        .node_listening_port
+        .unwrap_or_else(|| args.network.default_port());
+    let start_height = args
+        .start_height
+        .unwrap_or_else(|| args.network.start_height());
+    let protocol_version = args
+        .protocol_version
+        .unwrap_or_else(|| args.network.protocol_version());
+    constants::set_network_magic(args.network.magic());
+    info!(
+        "network={:?} protocol={protocol_version} height={start_height} port={node_listening_port}",
+        args.network
+    );
+
+    let seed_addrs = parse_addrs(args.seed_addrs, node_listening_port);
 
     // Create the crawler with the given listener address.
-    let crawler = Crawler::new().await;
+    let crawler = Crawler::new(start_height, protocol_version).await;
 
     let mut network_metrics = NetworkMetrics::default();
     let summary_snapshot = Arc::new(Mutex::new(NetworkSummary::default()));
@@ -166,27 +233,47 @@ async fn main() {
         let addr = *addr;
 
         tokio::spawn(async move {
+            let mut node = KnownNode::default();
+            node.is_seed = true;
             crawler_clone
                 .known_network
                 .nodes
                 .write()
-                .insert(addr, KnownNode::default());
+                .insert(addr, node);
 
             // Once the Version message is received in the process_message function,
             // GetAddr will be requested from the peer
-            let _ = crawler_clone.connect(addr).await;
+            if let Err(e) = crawler_clone.connect(addr).await {
+                warn!(parent: crawler_clone.node().span(), "seed connect {addr} failed: {e}");
+            }
         });
     }
 
-    // Wait for a single successful connection before proceeding.
-    wait_until!(Duration::from_secs(3), crawler.node().num_connected() >= 1);
+    // Wait briefly for at least one live connection, then continue anyway.
+    // Immediate RSTs from seeds are normal; a hard 3s timeout used to abort startup.
+    let connect_deadline = Instant::now() + Duration::from_secs(15);
+    while crawler.node().num_connected() == 0 && Instant::now() < connect_deadline {
+        sleep(Duration::from_millis(200)).await;
+    }
+    if crawler.node().num_connected() == 0 {
+        warn!("no connections after seed dial; continuing with known seeds");
+    }
 
     // Wait for one of the seed nodes to respond with a list of addrs.
-    wait_until!(
-        Duration::from_millis(SEED_RESPONSE_TIMEOUT_MS),
-        crawler.known_network.nodes().len() > seed_addrs.len(),
-        Duration::from_millis(SEED_WAIT_LOOP_INTERVAL_MS)
-    );
+    // A silent seed set used to abort the process; keep crawling the seeds we have.
+    let seed_wait_started = Instant::now();
+    while crawler.known_network.nodes().len() <= seed_addrs.len()
+        && seed_wait_started.elapsed() < Duration::from_millis(SEED_RESPONSE_TIMEOUT_MS)
+    {
+        sleep(Duration::from_millis(SEED_WAIT_LOOP_INTERVAL_MS)).await;
+    }
+    if crawler.known_network.nodes().len() <= seed_addrs.len() {
+        warn!(
+            "no seed returned addrs ({}/{} known); continuing",
+            crawler.known_network.num_nodes(),
+            seed_addrs.len()
+        );
+    }
 
     let crawler_clone = crawler.clone();
     let crawling_loop_task = tokio::spawn(async move {
@@ -212,31 +299,86 @@ async fn main() {
                     }
                 })
             {
-                warn!(parent: crawler.node().span(), "disconnecting from node {} because it didn't send us proper addr message", addr);
+                warn!(parent: crawler.node().span(), "disconnecting from node {} after {}s with no addr dump", addr, MAX_WAIT_FOR_ADDR_SECS);
                 crawler.node().disconnect(addr).await;
                 crawler
                     .known_network
                     .set_node_state(addr, ConnectionState::Disconnected);
             }
 
-            for (addr, _) in crawler
+            let due: Vec<(SocketAddr, crate::network::KnownNode)> = crawler
                 .known_network
                 .nodes()
                 .into_iter()
-                .filter(|(_, node)| {
-                    if let Some(i) = node.last_connected {
+                .filter(|(addr, node)| {
+                    let reconnect_due = if let Some(i) = node.last_connected {
                         i.elapsed().as_secs() >= RECONNECT_INTERVAL_SECS
                     } else {
                         true
-                    }
+                    };
+                    reconnect_due && crawler.should_connect(*addr)
                 })
-                .choose_multiple(&mut rand::thread_rng(), NUM_CONN_ATTEMPTS_PERIODIC)
-            {
+                .collect();
+
+            let targets = user_agent::TargetSet::from_nodes(
+                crawler.known_network.nodes().iter().map(|(a, n)| (a, n)),
+            );
+            let report = targets.report();
+            info!(parent: crawler.node().span(), "{report}");
+            if let Err(e) = std::fs::write(TARGETS_PATH, format!("{report}\n")) {
+                warn!(parent: crawler.node().span(), "couldn't write {TARGETS_PATH}: {e}");
+            }
+            let newest_zakura = targets.newest_zakura;
+
+            let is_target = |n: &crate::network::KnownNode| {
+                if n.is_zebra_7_plus() {
+                    return true;
+                }
+                match (n.impl_version(), newest_zakura) {
+                    (Some((user_agent::ImplKind::Zakura, version)), Some(newest)) => {
+                        version == newest
+                    }
+                    (Some((user_agent::ImplKind::Zakura, _)), None) => true,
+                    _ => false,
+                }
+            };
+            let target: Vec<_> = due.iter().filter(|(_, n)| is_target(n)).cloned().collect();
+            let preferred: Vec<_> = due
+                .iter()
+                .filter(|(_, n)| n.is_zebra_or_zakura() && !is_target(n))
+                .cloned()
+                .collect();
+            let unknown: Vec<_> = due
+                .iter()
+                .filter(|(_, n)| n.user_agent.is_none())
+                .cloned()
+                .collect();
+            let other: Vec<_> = due
+                .iter()
+                .filter(|(_, n)| n.user_agent.is_some() && !n.is_zebra_or_zakura())
+                .cloned()
+                .collect();
+
+            let chosen = {
+                let mut chosen = Vec::new();
+                let mut rng = rand::thread_rng();
+                let mut take = |bucket: Vec<(SocketAddr, crate::network::KnownNode)>,
+                                want: usize| {
+                    let room = NUM_CONN_ATTEMPTS_PERIODIC.saturating_sub(chosen.len());
+                    chosen.extend(bucket.into_iter().choose_multiple(&mut rng, want.min(room)));
+                };
+                take(target, NUM_CONN_ATTEMPTS_PERIODIC / 2);
+                take(preferred, NUM_CONN_ATTEMPTS_PERIODIC / 5);
+                // Leftover goes to unknown (new) peers first so early discovery is not starved.
+                take(unknown, NUM_CONN_ATTEMPTS_PERIODIC);
+                take(other, NUM_CONN_ATTEMPTS_PERIODIC);
+                chosen
+            };
+
+            for (addr, _) in chosen {
                 if crawler.should_connect(addr) {
                     let crawler_clone = crawler.clone();
                     tokio::spawn(async move {
-                        // Once the Version message is received in the process_message function,
-                        // GetAddr will be requested from the peer
                         let _ = crawler_clone.connect(addr).await;
                     });
                 }
@@ -307,7 +449,7 @@ mod tests {
             String::from("127.0.0.1"),
             String::from("192.0.2.235:54321"),
         ];
-        let parsed_addrs = parse_addrs(addrs);
+        let parsed_addrs = parse_addrs(addrs, ZCASH_P2P_DEFAULT_MAINNET_PORT);
 
         let correct_addrs = vec![
             SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 12345),

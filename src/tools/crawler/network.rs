@@ -38,8 +38,37 @@ pub struct KnownNode {
     pub services: Option<u64>,
     /// The number of subsequent connection errors.
     pub connection_failures: u8,
+    /// How many `getaddr` messages we have sent on the current connection.
+    pub getaddr_sent: u8,
+    /// True once this peer sent a usable `addr` / `addrv2` dump.
+    pub received_addr: bool,
+    /// When set, the peer is skipped until this instant (non-seeds only).
+    pub backoff_until: Option<Instant>,
+    /// True for addresses that came from the initial seed list.
+    pub is_seed: bool,
     /// The node's state.
     pub state: ConnectionState,
+}
+
+impl KnownNode {
+    /// Parsed Zebra or Zakura identity from the version user agent.
+    pub fn impl_version(
+        &self,
+    ) -> Option<(crate::user_agent::ImplKind, crate::user_agent::NodeVersion)> {
+        self.user_agent
+            .as_ref()
+            .and_then(|ua| crate::user_agent::classify(&ua.0))
+    }
+
+    pub fn is_zebra_or_zakura(&self) -> bool {
+        self.impl_version().is_some()
+    }
+
+    /// Zebra 7.x and anything newer. Older Zebra stays in the general preferred bucket.
+    pub fn is_zebra_7_plus(&self) -> bool {
+        self.impl_version()
+            .is_some_and(|(kind, version)| crate::user_agent::is_zebra_at_least_7(kind, version))
+    }
 }
 
 /// The list of nodes and connections the crawler is aware of.
@@ -69,6 +98,24 @@ impl KnownNetwork {
     pub fn set_node_state(&self, addr: SocketAddr, state: ConnectionState) {
         if let Some(node) = self.nodes.write().get_mut(&addr) {
             node.state = state;
+            if state == ConnectionState::Disconnected {
+                node.getaddr_sent = 0;
+            }
+        }
+    }
+
+    pub fn mark_received_addr(&self, addr: SocketAddr) {
+        if let Some(node) = self.nodes.write().get_mut(&addr) {
+            node.received_addr = true;
+        }
+    }
+
+    pub fn bump_getaddr_sent(&self, addr: SocketAddr) -> u8 {
+        if let Some(node) = self.nodes.write().get_mut(&addr) {
+            node.getaddr_sent = node.getaddr_sent.saturating_add(1);
+            node.getaddr_sent
+        } else {
+            0
         }
     }
 
